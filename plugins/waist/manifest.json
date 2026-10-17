@@ -1,0 +1,10 @@
+{
+  "id": "waist",
+  "name": "束腰测量 · 三点初测／两点验证",
+  "version": "0.1.0",
+  "entry": "waist_plugin:WaistPlugin",
+  "sdk_version": 2,
+  "dependencies": ["beamic-pro-sdk>=2.1,<3"],
+  "kind": "interactive",
+  "minimum_host_version": "0.4.0"
+}

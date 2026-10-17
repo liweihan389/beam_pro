@@ -1,0 +1,6 @@
+# Verified locally on CPython 3.12; Windows wheel availability is checked by the build.
+numpy==2.3.5
+scipy==1.18.1
+PySide6-Essentials==6.12.0
+packaging==26.3
+

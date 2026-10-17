@@ -1,0 +1,5 @@
+{
+  "id": "level", "name": "单镜等高与准直", "version": "0.1.0",
+  "entry": "level_plugin:LevelPlugin", "sdk_version": 2,
+  "dependencies": [], "kind": "interactive", "minimum_host_version": "0.5.0"
+}

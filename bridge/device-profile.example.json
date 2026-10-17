@@ -1,0 +1,21 @@
+{
+  "beamMicDirectory": "C:\\Program Files\\Spiricon\\BeamMic",
+  "instanceName": "BeamicPro",
+  "framePath": "ResultsPriorityFrame",
+  "imagePath": "ResultsPriorityFrame.DoubleData",
+  "widthPath": "FrameInfoResults.Width",
+  "heightPath": "FrameInfoResults.Height",
+  "idPath": "FrameInfoResults.ID",
+  "frameExposurePath": "FrameInfoResults.Exposure",
+  "coordinatePaths": ["FrameInfoResults.Width", "FrameInfoResults.Height", "FrameInfoResults.OffsetX", "FrameInfoResults.OffsetY", "FrameInfoResults.BinningX", "FrameInfoResults.BinningY", "FrameInfoResults.ScaleMultiplier", "FrameInfoResults.Gamma", "FrameInfoResults.BitsPerPixel", "FrameInfoResults.Gain", "FrameInfoResults.BlackLevel"],
+  "fullScale": 0,
+  "saturationVerified": false,
+  "frameExposureVerified": false,
+  "verifiedForAssemblyVersion": "",
+  "verifiedForSource": "",
+  "verifiedBitsPerPixel": 0,
+  "frameExposureToUs": 0,
+  "pixelPitchUm": 0,
+  "processingDescription": "unverified — fill from installed BeamMic documentation and calibration"
+}
+
