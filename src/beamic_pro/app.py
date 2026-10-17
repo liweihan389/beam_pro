@@ -47,6 +47,7 @@ from .measurement import Capture
 from .plugin_panel import PluginPanel
 from .plugin_runtime import PluginProcess
 from .plugin_store import PluginStore
+from .preview import PreviewFrame
 from .simulator import Simulator
 from .stream import AdaptiveRate, Latest, RateMeter, SharedPublisher
 from .view import BeamView
@@ -121,6 +122,7 @@ class Window(QMainWindow):
         self.plugin_states = {}
         self.overlays = {}
         self.capture_ready = False
+        self.capabilities = {}
         self.control_report = None
         self.installing = False
         self.closing = False
@@ -433,7 +435,7 @@ class Window(QMainWindow):
         executable, _ = QFileDialog.getOpenFileName(self, "选择 BeamMicBridge.exe", str(default), "桥接程序 (*.exe)")
         if not executable:
             return
-        profile, _ = QFileDialog.getOpenFileName(self, "选择已核对的设备配置", str(self.assets / "bridge"), "设备配置 (*.json)")
+        profile, _ = QFileDialog.getOpenFileName(self, "选择设备配置（默认配置支持预览）", str(self.assets / "bridge"), "设备配置 (*.json)")
         if not profile:
             return
         old_source, self.source = self.source, None
@@ -577,6 +579,17 @@ class Window(QMainWindow):
                 self.activate(result["manifest"]["id"])
         elif kind == "log":
             self.log_message(result["message"])
+        elif kind == "status_report":
+            try:
+                report = result["report"]
+                if "capabilities" in result:
+                    report["capabilities"] = result["capabilities"]
+                if result.get("probe_error"):
+                    report["probe_error"] = result["probe_error"]
+                Path(result["filename"]).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+                self.log_message("状态与接口诊断报告已导出")
+            except (OSError, ValueError, TypeError) as error:
+                self.log_message("状态报告导出失败：" + str(error))
         elif kind == "error":
             self.pending_exposure = False
             self.installing = False
@@ -609,7 +622,10 @@ class Window(QMainWindow):
             self.release_fixed_circle()
         self.coordinate_key = frame.coordinate_key
         self.last_frame = frame
-        if self.control_report is not None:
+        if isinstance(frame, PreviewFrame):
+            self.capture_ready = False
+            self.capture = None
+        if self.control_report is not None and not isinstance(frame, PreviewFrame):
             self.capture_ready = bool(self.capabilities.get("exposure_control") and self.capabilities.get("exposure_owned") and frame.exposure_verified
                                       and frame.saturation_verified
                                       and self.control_report.get("coordinate_key") == frame.coordinate_key)
@@ -633,7 +649,11 @@ class Window(QMainWindow):
                 except Exception as error:
                     self.signals.operation.emit({"kind": "error", "message": str(error), "generation": generation})
             self.pool.submit(set_exposure)
-        self.exposure_label.setText(f"{frame.exposure_us / 1000:.3f} ms · {self.exposure.state.reason}")
+        if isinstance(frame, PreviewFrame):
+            self.exposure_label.setText("曝光未知 · 仅预览，暂不自动调曝光")
+            self.capture_label.setText("已读取数值图像；定位圈仅供预览，曝光与量程验证后开放测量")
+        else:
+            self.exposure_label.setText(f"{frame.exposure_us / 1000:.3f} ms · {self.exposure.state.reason}")
 
     def painted(self, identity):
         if self.last_frame and identity == self.last_frame.frame_id:
@@ -645,6 +665,8 @@ class Window(QMainWindow):
         if generation != self.source_generation or selection_generation != self.selection_generation or self.closing:
             return
         if self.last_frame and frame.coordinate_key != self.last_frame.coordinate_key:
+            return
+        if self.last_frame and isinstance(frame, PreviewFrame) != isinstance(self.last_frame, PreviewFrame):
             return
         if self.last_fit and fit.frame_id <= self.last_fit.frame_id:
             return
@@ -687,7 +709,7 @@ class Window(QMainWindow):
                 self.capture = None
                 self.capture_label.setText(str(error))
                 self.reset_interactive(str(error))
-        if self.plugins:
+        if self.plugins and not isinstance(frame, PreviewFrame):
             descriptor = self.publisher.publish(frame)
             descriptor["frame"]["metadata"] = {**frame.metadata, "measurement_stable": bool(stable), "quantitative_ready": self.capture_ready,
                                                 "selection": self.view.selection,
@@ -698,7 +720,8 @@ class Window(QMainWindow):
 
     def update_status(self):
         latency = float(np.percentile(self.latencies, 95)) if self.latencies else 0
-        self.metrics_label.setText(f"新帧 {self.received_rate.fps:.1f} FPS · 有效拟合 {self.fit_rate.fps:.1f} FPS · "
+        label = "预览收帧（帧标识未验证）" if isinstance(self.last_frame, PreviewFrame) else "新帧"
+        self.metrics_label.setText(f"{label} {self.received_rate.fps:.1f} FPS · 有效拟合 {self.fit_rate.fps:.1f} FPS · "
                                   f"显示 {self.display_rate.fps:.1f} FPS · 收帧→显示 P95 {latency:.1f} ms · 当前目标 {self.rate.current:g}")
         throughput = self.received_rate.fps
         if self.processed_rate.fps > 0:
@@ -1094,7 +1117,8 @@ class Window(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(self, "导出状态报告", "beamic-status.json", "状态报告 (*.json)")
         if not filename:
             return
-        report = {"simulated": isinstance(self.source, Simulator), "capabilities": getattr(self, "capabilities", {}),
+        from . import __version__
+        report = {"application_version": __version__, "simulated": isinstance(self.source, Simulator), "capabilities": getattr(self, "capabilities", {}),
                   "requested_fps": self.rate.requested, "current_target_fps": self.rate.current,
                   "received_fps": self.received_rate.fps, "effective_fit_fps": self.fit_rate.fps,
                   "display_fps": self.display_rate.fps, "images_saved": False,
@@ -1105,7 +1129,18 @@ class Window(QMainWindow):
                                      "boundary_fraction": self.fit_settings.boundary_fraction,
                                      "boundary_kind": "relative_intensity"}
         report["auto_exposure"] = self.exposure.enabled
-        Path(filename).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        report["preview_only"] = isinstance(self.last_frame, PreviewFrame) or self.capabilities.get("preview_only", False)
+        report["fps_note"] = "预览收帧速度不代表已验证的相机有效新帧速度" if report["preview_only"] else "有效新帧率仍需实机核查"
+        source, generation = self.source, self.source_generation
+        def export():
+            event = {"kind": "status_report", "report": report, "filename": filename, "generation": generation}
+            if isinstance(source, BridgeClient):
+                try:
+                    event["capabilities"] = source.command("probe")
+                except Exception as error:
+                    event["probe_error"] = str(error)
+            self.signals.operation.emit(event)
+        self.pool.submit(export)
 
     def closeEvent(self, event):
         if self.closing:

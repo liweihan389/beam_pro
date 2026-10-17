@@ -1,14 +1,18 @@
 # beamic pro
 
-通过 Ophir BeamMic 连接相机的中文光学实验助手，当前版本 **0.5.0**。
+通过 Ophir BeamMic 连接相机的中文光学实验助手，当前版本 **0.5.1**。
 
 ## Windows 下载与运行
 
 从 [Releases](https://github.com/liweihan389/beam_pro/releases) 下载：
 
-- `beamic-pro-0.5.0-setup.exe`：安装到当前用户目录，并创建开始菜单入口。
-- `beamic-pro-0.5.0-windows-portable.zip`：免安装版，解压后运行 `beamic-pro.exe`。
+- `beamic-pro-0.5.1-setup.exe`：安装到当前用户目录，并创建开始菜单入口。
+- `beamic-pro-0.5.1-windows-portable.zip`：免安装版，解压后运行 `beamic-pro.exe`。
 - `SHA256SUMS.txt`：下载文件的SHA256校验值。
+
+0.5.1 修正默认 BeamMic 接口映射：图像尺寸、数值图像和候选帧标识均从 `ResultsPriorityFrame` 读取，兼容整数、字符串及 GUID 标识。默认配置提供数值图像预览和虚线定位圈；曝光、线性量程、坐标与帧标识未验证时，不自动调曝光，不向插件提供定量帧，也不开放正式记录。
+
+连接时选择新版随附的 `device-profile.example.json`，曝光预检报告可先取消。默认配置保留未知的曝光、Gamma 和饱和量程；不会从位深推测量程或把当前曝光设置当作逐帧曝光。旧版配置文件不会自动迁移。点击“状态与预检”的导出按钮会刷新接口诊断，报告包含字段类型、数组结构、最近帧标识和数值范围，不包含像素图像；预览帧率不代表已验证的相机有效新帧率。
 
 使用 Windows x64；.NET Framework 4.8 是桥接程序的运行要求。真实相机连接需要已授权的原版 BeamMic 和相机驱动。第一次建立独立的共享插件环境需要联网安装依赖。
 

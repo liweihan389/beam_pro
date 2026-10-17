@@ -12,6 +12,8 @@ from pathlib import Path
 import numpy as np
 from beamic_sdk import Frame
 
+from .preview import PreviewFrame
+
 
 class BridgeClient:
     def __init__(self, executable: Path, profile: Path | None, event_callback):
@@ -104,6 +106,8 @@ class BridgeClient:
             return None
         metadata = dict(descriptor["frame"])
         metadata["received_ns"] = time.monotonic_ns()
+        if descriptor.get("preview_only"):
+            return PreviewFrame(pixels=pixels, **metadata)
         return Frame(pixels=pixels, **metadata)
 
     def set_exposure(self, value):

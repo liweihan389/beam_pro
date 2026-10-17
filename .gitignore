@@ -8,6 +8,8 @@ build/
 dist/
 bridge/bin/
 bridge/obj/
+bridge-tests/bin/
+bridge-tests/obj/
 artifacts/
 .local-state/
 .build-venv/

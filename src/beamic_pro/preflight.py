@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from .bridge_client import BridgeClient
+from .preview import PreviewFrame
 
 
 def validate_control_frames(baseline: list[dict], changed: list[dict], requested_us: float) -> tuple[bool, str]:
@@ -39,7 +40,7 @@ def validate_control_frames(baseline: list[dict], changed: list[dict], requested
 
 
 def run_preflight(executable, profile, seconds=10, control_test=False):
-    events, summaries = [], deque(maxlen=400)
+    events, summaries, previews = [], deque(maxlen=400), deque(maxlen=400)
     event_lock = threading.Lock()
     holder = []
     def receive(value):
@@ -47,6 +48,10 @@ def run_preflight(executable, profile, seconds=10, control_test=False):
         if value.get("type") == "frame" and holder:
             frame = holder[0].read_frame(value["descriptor"])
             if frame is not None:
+                if isinstance(frame, PreviewFrame):
+                    with event_lock:
+                        previews.append({"stamp": stamp, "frame_id": frame.frame_id, "shape": list(frame.shape)})
+                    return
                 stride = max(1, max(frame.shape) // 200)
                 sample = frame.pixels[::stride, ::stride]
                 bg = float(np.percentile(sample, 20))
@@ -95,6 +100,10 @@ def run_preflight(executable, profile, seconds=10, control_test=False):
         report["source"] = client.capabilities.get("source")
         with event_lock:
             baseline = list(summaries)
+            preview_samples = list(previews)
+        report["preview_frames_received"] = len(preview_samples)
+        report["preview_delivery_fps"] = ((len(preview_samples)-1) / (preview_samples[-1]["stamp"]-preview_samples[0]["stamp"])
+                                          if len(preview_samples) > 1 else 0)
         report["frames_received"] = len(baseline)
         report["actual_fps"] = (len(baseline)-1) / (baseline[-1]["stamp"]-baseline[0]["stamp"]) if len(baseline)>1 else 0
         report["unique_frame_ids"] = len({f["frame_id"] for f in baseline})

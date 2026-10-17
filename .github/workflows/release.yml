@@ -55,6 +55,8 @@ jobs:
 
           包含实时光斑定位与定圈、自动曝光、双镜合束、束腰测量、单镜等高与可选准直，以及 Python 插件支持。
 
+          此版本修正默认 BeamMic 字段映射并增加独立数值预览与接口诊断。连接时使用新版 device-profile.example.json，曝光预检报告可先取消。未知曝光、量程及坐标信息仍需实机验证；预览圈不作为正式测量，默认配置暂不接管曝光。
+
           下载 setup.exe 安装，或解压 windows-portable.zip 后运行 beamic-pro.exe。需要 Windows x64 和 .NET Framework 4.8；实机连接还需已授权的 BeamMic 与相机驱动。首次建立共享插件环境需要联网。
 
           安装包由 GitHub Actions 在 Windows 上运行自动化测试后构建。真实相机兼容性、实验精度和20有效帧/秒目标仍需实验室验收。

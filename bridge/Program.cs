@@ -19,15 +19,18 @@ namespace BeamicPro.Bridge
         public string instanceName { get; set; } = "BeamicPro";
         public string framePath { get; set; } = "ResultsPriorityFrame";
         public string imagePath { get; set; } = "ResultsPriorityFrame.DoubleData";
-        public string widthPath { get; set; } = "FrameInfoResults.Width";
-        public string heightPath { get; set; } = "FrameInfoResults.Height";
-        public string idPath { get; set; } = "FrameInfoResults.ID";
-        public string frameExposurePath { get; set; } = "FrameInfoResults.Exposure";
+        public string widthPath { get; set; } = "ResultsPriorityFrame.Width";
+        public string heightPath { get; set; } = "ResultsPriorityFrame.Height";
+        public string idPath { get; set; } = "ResultsPriorityFrame.UniqueKey";
+        // Unknown exposure/processing metadata must not prevent numerical preview.
+        public string frameExposurePath { get; set; } = "";
+        public string bitsPerPixelPath { get; set; } = "ResultsPriorityFrame.OriginalBpp";
+        public string gammaPath { get; set; } = "";
+        public bool frameIdentityVerified { get; set; } = false;
         public string[] coordinatePaths { get; set; } = new[] {
-            "FrameInfoResults.Width", "FrameInfoResults.Height", "FrameInfoResults.OffsetX",
-            "FrameInfoResults.OffsetY", "FrameInfoResults.BinningX", "FrameInfoResults.BinningY",
-            "FrameInfoResults.ScaleMultiplier", "FrameInfoResults.Gamma", "FrameInfoResults.BitsPerPixel",
-            "FrameInfoResults.Gain", "FrameInfoResults.BlackLevel" };
+            "ResultsPriorityFrame.Width", "ResultsPriorityFrame.Height", "ResultsPriorityFrame.OriginalBpp",
+            "ResultsPriorityFrame.IsBaselineCalibrated", "ResultsPriorityFrame.IsFrameCalibrated",
+            "ResultsPriorityFrame.BaseLineOffset" };
         public double fullScale { get; set; } = 0;
         public bool saturationVerified { get; set; } = false;
         public bool frameExposureVerified { get; set; } = false;
@@ -53,7 +56,10 @@ namespace BeamicPro.Bridge
         private volatile bool stopped;
         private volatile bool paused = true;
         private double fps = 20, unitToUs;
-        private long epoch, lastVendorId = -1, sequence;
+        private long epoch, sequence;
+        private string lastVendorId;
+        private readonly Queue<object> frameSamples = new Queue<object>();
+        private long frameEventCount, duplicateFrames, inconsistentFrames;
         private string verifiedVersion;
         private MemoryMappedFile map;
         private MemoryMappedViewAccessor view;
@@ -81,16 +87,7 @@ namespace BeamicPro.Bridge
 
         private object PathValue(string path)
         {
-            object value = app;
-            foreach (var name in path.Split('.'))
-            {
-                if (value == null) throw new InvalidOperationException("Null at " + path);
-                var type = value.GetType();
-                var property = type.GetProperty(name) ?? type.GetInterfaces().Select(i => i.GetProperty(name)).FirstOrDefault(p => p != null);
-                if (property == null) throw new MissingMemberException(type.FullName, name);
-                value = property.GetValue(value, null);
-            }
-            return value;
+            return VendorAccess.Value(app, path);
         }
 
         private object Invoke(object target, string name, params object[] arguments)
@@ -120,8 +117,10 @@ namespace BeamicPro.Bridge
                         && !String.IsNullOrEmpty(profile.verifiedForSource)
                         && profile.verifiedForSource == Convert.ToString(PathValue("DataSource.DataSource"), CultureInfo.InvariantCulture)
                         && profile.verifiedBitsPerPixel > 0
-                        && Convert.ToInt32(PathValue("FrameInfoResults.BitsPerPixel")) == profile.verifiedBitsPerPixel
-                        && Math.Abs(Number(PathValue("FrameInfoResults.Gamma")) - 1) < 0.000001;
+                        && profile.frameIdentityVerified
+                        && Convert.ToInt32(PathValue(profile.bitsPerPixelPath)) == profile.verifiedBitsPerPixel
+                        && !String.IsNullOrEmpty(profile.gammaPath)
+                        && Math.Abs(Number(PathValue(profile.gammaPath)) - 1) < 0.000001;
                 } catch { return false; }
             }
         }
@@ -167,7 +166,9 @@ namespace BeamicPro.Bridge
                 ["saturation_verified"] = Verified && profile.saturationVerified && profile.fullScale > 0,
                 ["exposure_verified"] = Verified && profile.frameExposureVerified && profile.frameExposureToUs > 0,
                 ["numeric_images"] = false, ["frame_ids"] = false, ["ready"] = false,
-                ["members"] = DiscoverMembers(), ["note"] = "Frame fields are runtime-probed. No camera throughput guarantee."
+                ["members"] = DiscoverMembers(), ["diagnostics"] = Diagnostics(),
+                ["preview_only"] = true,
+                ["note"] = "UniqueKey is a candidate frame marker until runtime/vendor verification. Preview brightness is not a saturation calibration."
             };
             try
             {
@@ -196,7 +197,8 @@ namespace BeamicPro.Bridge
         private Dictionary<string, string[]> DiscoverMembers()
         {
             var result = new Dictionary<string, string[]>();
-            foreach (var name in new[] { "", profile.framePath, "FrameInfoResults", "EGB", "Calibration", "DataSource" })
+            foreach (var name in new[] { "", profile.framePath, "FrameInfoResults", "EGB", "Calibration", "DataSource",
+                "ResultsPriorityFrame.FrameData", "ResultsPriorityFrame.CalibratedData", "ResultsPriorityFrame.Calibration", "OpticalScale" })
             {
                 try {
                     var target = name == "" ? app : PathValue(name);
@@ -206,7 +208,33 @@ namespace BeamicPro.Bridge
             }
             return result;
         }
-        private void FrameReady() { if (!stopped && !paused) newFrame.Set(); }
+        private object Diagnostics()
+        {
+            var paths = new[] { profile.framePath, profile.imagePath, profile.widthPath, profile.heightPath,
+                profile.idPath, profile.frameExposurePath, profile.bitsPerPixelPath, profile.gammaPath,
+                "ResultsPriorityFrame.HasData", "ResultsPriorityFrame.CalibratedData", "ResultsPriorityFrame.FrameData",
+                "Calibration.Status", "DataSource.Status" }.Concat(profile.coordinatePaths ?? new string[0]);
+            return new {
+                fields = VendorAccess.Describe(app, paths),
+                methods = VendorAccess.Methods(app, new[] { profile.framePath, "EGB", "DataSource", "Calibration" }),
+                new_frame_events = Interlocked.Read(ref frameEventCount),
+                duplicate_markers = duplicateFrames, inconsistent_snapshots = inconsistentFrames,
+                frame_samples = frameSamples.ToArray(), images_saved = false,
+                missing_requirements = new[] {
+                    !profile.frameIdentityVerified ? "Frame marker semantics and coordinate/processing stability unverified" : null,
+                    !(Verified && profile.frameExposureVerified && profile.frameExposureToUs > 0) ? "Frame-associated exposure unverified" : null,
+                    !(Verified && profile.saturationVerified && profile.fullScale > 0) ? "Linear image stage and saturation scale unverified" : null
+                }.Where(v => v != null).ToArray()
+            };
+        }
+        private void FrameReady() {
+            Interlocked.Increment(ref frameEventCount);
+            if (!stopped && !paused) newFrame.Set();
+        }
+        private string FrameMarker() {
+            try { return VendorAccess.Token(PathValue(profile.idPath)); }
+            catch { return null; } // Untyped/missing markers allow preview only; diagnostics retain the error/type.
+        }
 
         private void ReadFrames()
         {
@@ -223,36 +251,39 @@ namespace BeamicPro.Bridge
                     Dictionary<string, object> descriptor;
                     lock (sdkLock)
                     {
-                        var before = Convert.ToInt64(PathValue(profile.idPath));
-                        if (before == lastVendorId) continue;
-                        int width = Convert.ToInt32(PathValue(profile.widthPath)), height = Convert.ToInt32(PathValue(profile.heightPath));
-                        if (width <= 0 || height <= 0 || (long)width * height > 50000000)
-                            throw new InvalidOperationException("Invalid numeric image dimensions");
-                        var array = PathValue(profile.imagePath) as Array;
-                        if (array == null || array.Rank != 1 || array.Length != width * height)
-                            throw new InvalidOperationException("Image member is not a matching numeric raster");
-                        var values = new float[array.Length];
-                        if (array is double[] doubles) {
-                            for (int i = 0; i < doubles.Length; i++) {
-                                if (!Finite(doubles[i])) throw new InvalidOperationException("Nonfinite pixels");
-                                values[i] = (float)doubles[i];
-                            }
-                        } else if (array is float[] floats) {
-                            Array.Copy(floats, values, values.Length);
-                            if (values.Any(v => !Finite(v))) throw new InvalidOperationException("Nonfinite pixels");
-                        } else {
-                            for (int i = 0; i < array.Length; i++) {
-                                double value = Number(array.GetValue(i));
-                                if (!Finite(value)) throw new InvalidOperationException("Nonfinite pixels");
-                                values[i] = (float)value;
-                            }
+                        var before = FrameMarker();
+                        if (before != null && before == lastVendorId) {
+                            duplicateFrames++;
+                            // A constant object key might not identify frames. Until verified,
+                            // deliver event-triggered preview without claiming unique camera frames.
+                            if (profile.frameIdentityVerified) continue;
                         }
-                        var coordinate = profile.coordinatePaths.Select(p => p + "=" + Convert.ToString(PathValue(p), CultureInfo.InvariantCulture)).ToArray();
-                        double exposureUs = Number(PathValue(profile.frameExposurePath)) * profile.frameExposureToUs;
-                        var after = Convert.ToInt64(PathValue(profile.idPath));
-                        if (before != after) continue;
-                        if (!Finite(exposureUs) || exposureUs <= 0 || profile.fullScale <= 0)
-                            throw new InvalidOperationException("Exposure association or saturation full scale is unconfigured");
+                        int width = Convert.ToInt32(PathValue(profile.widthPath)), height = Convert.ToInt32(PathValue(profile.heightPath));
+                        var array = PathValue(profile.imagePath) as Array;
+                        var values = VendorAccess.Raster(array, width, height);
+                        bool coordinatesComplete = true;
+                        var coordinate = new List<string> { "source=" + SafeValue("DataSource.DataSource"),
+                            "image=" + profile.imagePath, "width=" + width, "height=" + height };
+                        foreach (var path in profile.coordinatePaths ?? new string[0]) {
+                            try { coordinate.Add(path + "=" + Convert.ToString(PathValue(path), CultureInfo.InvariantCulture)); }
+                            catch { coordinatesComplete = false; coordinate.Add(path + "=?"); }
+                        }
+                        double? exposureUs = null;
+                        if (!String.IsNullOrWhiteSpace(profile.frameExposurePath) && profile.frameExposureToUs > 0) {
+                            try {
+                                double value = Number(PathValue(profile.frameExposurePath)) * profile.frameExposureToUs;
+                                if (Finite(value) && value > 0) exposureUs = value;
+                            } catch { /* Missing quantitative metadata does not block preview. */ }
+                        }
+                        var after = FrameMarker();
+                        if (before != after) { inconsistentFrames++; continue; }
+                        bool verified = Verified;
+                        bool quantitative = verified && after != null && coordinatesComplete && exposureUs.HasValue && profile.frameExposureVerified
+                            && profile.saturationVerified && Finite(profile.fullScale) && profile.fullScale > 0;
+                        frameSamples.Enqueue(new { marker = after, elapsed_ms = clock.ElapsedMilliseconds,
+                            width, height, minimum = values.Min(), maximum = values.Max(), frame_exposure_us = exposureUs,
+                            preview_only = !quantitative });
+                        while (frameSamples.Count > 20) frameSamples.Dequeue();
                         if (map == null || values.Length > capacity) Allocate(values.Length);
                         slot = (slot + 1) % 3;
                         long offset = slot * slotSpan;
@@ -266,30 +297,37 @@ namespace BeamicPro.Bridge
                         descriptor = new Dictionary<string, object> {
                             ["map_name"] = mapName, ["map_size"] = 3L * slotSpan,
                             ["offset"] = offset, ["sequence"] = sequence, ["shape"] = new[] { height, width },
+                            ["preview_only"] = !quantitative,
                             ["frame"] = new Dictionary<string, object> {
                                 ["frame_id"] = sequence / 2, ["received_ns"] = 0,
-                                ["exposure_us"] = exposureUs, ["exposure_epoch"] = epoch,
-                                ["coordinate_key"] = String.Join("|", coordinate), ["full_scale"] = profile.fullScale,
-                                ["pixel_pitch_um"] = profile.pixelPitchUm > 0 ? (object)profile.pixelPitchUm : null,
-                                ["timestamp_source"] = "host_receive_only", ["exposure_verified"] = Verified && profile.frameExposureVerified,
-                                ["saturation_verified"] = Verified && profile.saturationVerified,
-                                ["metadata"] = new { assembly_version = verifiedVersion, processing = profile.processingDescription, vendor_frame_id = after, simulated = false }
+                                ["exposure_us"] = quantitative ? (object)exposureUs.Value : null, ["exposure_epoch"] = epoch,
+                                ["coordinate_key"] = String.Join("|", coordinate), ["full_scale"] = quantitative ? (object)profile.fullScale : null,
+                                ["pixel_pitch_um"] = quantitative && profile.pixelPitchUm > 0 ? (object)profile.pixelPitchUm : null,
+                                ["timestamp_source"] = "host_receive_only", ["exposure_verified"] = quantitative,
+                                ["saturation_verified"] = quantitative,
+                                ["metadata"] = new { assembly_version = verifiedVersion, processing = profile.processingDescription,
+                                    vendor_frame_id = after, frame_identity_verified = verified && profile.frameIdentityVerified,
+                                    preview_only = !quantitative, simulated = false }
                             }
                         };
+                        bool changed = !numericReported || !Equals(capabilities["preview_only"], !quantitative);
+                        numericReported = true;
+                        capabilities["numeric_images"] = true;
+                        capabilities["frame_ids"] = after != null && verified && profile.frameIdentityVerified;
+                        capabilities["frame_marker_available"] = after != null;
+                        capabilities["source"] = SafeValue("DataSource.DataSource");
+                        capabilities["profile_verified"] = verified;
+                        capabilities["saturation_verified"] = quantitative;
+                        capabilities["exposure_verified"] = quantitative;
+                        capabilities["preview_only"] = !quantitative;
+                        capabilities["ready"] = quantitative && exposureControl && manualExposureOwned;
+                        if (changed) {
+                            capabilities["diagnostics"] = Diagnostics();
+                            Emit(new { type = "capabilities", report = capabilities });
+                        }
                     }
                     lastRead = clock.Elapsed.TotalSeconds;
                     consecutiveErrors = 0;
-                    if (!numericReported) {
-                        numericReported = true;
-                        capabilities["numeric_images"] = true;
-                        capabilities["frame_ids"] = true;
-                        capabilities["source"] = SafeValue("DataSource.DataSource");
-                        capabilities["profile_verified"] = Verified;
-                        capabilities["saturation_verified"] = Verified && profile.saturationVerified;
-                        capabilities["exposure_verified"] = Verified && profile.frameExposureVerified;
-                        capabilities["ready"] = Verified && profile.saturationVerified && profile.frameExposureVerified && exposureControl;
-                        Emit(new { type = "capabilities", report = capabilities });
-                    }
                     Emit(new { type = "frame", descriptor });
                 }
                 catch (Exception error)
@@ -343,9 +381,17 @@ namespace BeamicPro.Bridge
                     capabilities["exposure_owned"] = manualExposureOwned;
                     capabilities["source"] = SafeValue("DataSource.DataSource");
                     capabilities["profile_verified"] = Verified;
-                    capabilities["saturation_verified"] = Verified && profile.saturationVerified;
-                    capabilities["exposure_verified"] = Verified && profile.frameExposureVerified;
+                    bool quantitative = numericReported && !(bool)capabilities["preview_only"] && Verified;
+                    capabilities["frame_ids"] = quantitative && profile.frameIdentityVerified;
+                    capabilities["saturation_verified"] = quantitative && profile.saturationVerified;
+                    capabilities["exposure_verified"] = quantitative && profile.frameExposureVerified;
+                    capabilities["ready"] = quantitative && exposureControl && manualExposureOwned;
                     capabilities["members"] = DiscoverMembers();
+                    capabilities["diagnostics"] = Diagnostics();
+                    try {
+                        capabilities["current_exposure_setting_us"] = Number(Egb("Get")) * unitToUs;
+                        capabilities["exposure_setting_note"] = "Current setting only; not frame-associated exposure";
+                    } catch { capabilities["current_exposure_setting_us"] = null; }
                     Emit(new { type = "capabilities", report = capabilities });
                     return capabilities;
                 }

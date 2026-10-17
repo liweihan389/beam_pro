@@ -16,6 +16,7 @@ Invoke-Checked $Python @('-m', 'pytest', '-q')
 $Version = (& $Python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])').Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Cannot read application version.' }
 Invoke-Checked 'dotnet' @('build', 'bridge\BeamMicBridge.csproj', '-c', 'Release')
+Invoke-Checked 'dotnet' @('run', '--project', 'bridge-tests\BeamMicBridge.Tests.csproj', '-c', 'Release', '-f', 'net48')
 Invoke-Checked $Python @('-m', 'build', 'sdk', '--wheel', '--outdir', 'build\wheels')
 Invoke-Checked $Python @('scripts\package_plugins.py')
 $Separator = ';'

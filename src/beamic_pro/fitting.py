@@ -97,7 +97,8 @@ def fit_beam(frame: Frame, selection=None, settings: FitSettings = DEFAULT_SETTI
     median = ndimage.median_filter(corrected, size=3)
     signal = ndimage.gaussian_filter(median, .65)
     peak = float(signal.max())
-    if peak < settings.min_snr * noise or peak < .005 * frame.full_scale:
+    scale = frame.full_scale
+    if peak < settings.min_snr * noise or (scale is not None and peak < .005 * scale):
         return fail("无信号或信噪比不足", roi)
     level = peak * settings.boundary_fraction
     if level < 5 * noise:
@@ -211,7 +212,8 @@ def fit_beam(frame: Frame, selection=None, settings: FitSettings = DEFAULT_SETTI
     holes = float(np.count_nonzero(filled & ~component) / max(filled.sum(), 1))
     area_y, area_x = np.nonzero(component)
     area_cx, area_cy = float(area_x.mean()), float(area_y.mean())
-    saturation = (raw >= frame.full_scale * .999) & ndimage.binary_dilation(filled, iterations=3)
+    saturation = ((raw >= scale * .999) & ndimage.binary_dilation(filled, iterations=3)
+                  if scale is not None else np.zeros(raw.shape, dtype=bool))
     saturated_fraction = float(saturation.sum() / max(filled.sum(), 1))
     warnings = []
     if bimodal:
@@ -235,6 +237,8 @@ def fit_beam(frame: Frame, selection=None, settings: FitSettings = DEFAULT_SETTI
         valid, reason = False, "1/e²处分离的光斑或超过两个主峰，请框选单个主光斑"
     elif not solution.success or minor < 2 or holes > .20 or (not bimodal and (rms > .04 or coverage < .80 or longest_gap > 5 or missing > .15)):
         valid, reason = False, "明显遮挡、边界不足或拟合不可靠，暂停测量"
+    if scale is None:
+        valid, reason = False, "预览定位圈；饱和与数据处理未验证 · " + reason
     selected_cx, selected_cy = (cx, cy) if settings.center_mode == "boundary" else (area_cx, area_cy)
     return BeamFit(frame.frame_id, selected_cx + x0, selected_cy + y0, major, minor, angle,
                    peak, float(background.mean()), rms, saturated_fraction, valid, reason, roi,

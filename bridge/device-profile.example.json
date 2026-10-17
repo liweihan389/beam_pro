@@ -3,11 +3,14 @@
   "instanceName": "BeamicPro",
   "framePath": "ResultsPriorityFrame",
   "imagePath": "ResultsPriorityFrame.DoubleData",
-  "widthPath": "FrameInfoResults.Width",
-  "heightPath": "FrameInfoResults.Height",
-  "idPath": "FrameInfoResults.ID",
-  "frameExposurePath": "FrameInfoResults.Exposure",
-  "coordinatePaths": ["FrameInfoResults.Width", "FrameInfoResults.Height", "FrameInfoResults.OffsetX", "FrameInfoResults.OffsetY", "FrameInfoResults.BinningX", "FrameInfoResults.BinningY", "FrameInfoResults.ScaleMultiplier", "FrameInfoResults.Gamma", "FrameInfoResults.BitsPerPixel", "FrameInfoResults.Gain", "FrameInfoResults.BlackLevel"],
+  "widthPath": "ResultsPriorityFrame.Width",
+  "heightPath": "ResultsPriorityFrame.Height",
+  "idPath": "ResultsPriorityFrame.UniqueKey",
+  "frameExposurePath": "",
+  "bitsPerPixelPath": "ResultsPriorityFrame.OriginalBpp",
+  "gammaPath": "",
+  "frameIdentityVerified": false,
+  "coordinatePaths": ["ResultsPriorityFrame.Width", "ResultsPriorityFrame.Height", "ResultsPriorityFrame.OriginalBpp", "ResultsPriorityFrame.IsBaselineCalibrated", "ResultsPriorityFrame.IsFrameCalibrated", "ResultsPriorityFrame.BaseLineOffset"],
   "fullScale": 0,
   "saturationVerified": false,
   "frameExposureVerified": false,
@@ -16,6 +19,6 @@
   "verifiedBitsPerPixel": 0,
   "frameExposureToUs": 0,
   "pixelPitchUm": 0,
-  "processingDescription": "unverified — fill from installed BeamMic documentation and calibration"
+  "processingDescription": "preview only — frame identity, exposure association, coordinates, linearity and saturation remain unverified"
 }
 

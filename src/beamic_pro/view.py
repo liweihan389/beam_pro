@@ -44,6 +44,11 @@ class BeamView(QGraphicsView):
             background = background + fit.background_slope_x * xx + fit.background_slope_y * yy
             normalized = np.clip((frame.pixels - background) / fit.amplitude, 0, 1)
             threshold = fit.boundary_fraction
+        elif frame.full_scale is None:
+            # Display normalization is not a saturation or intensity calibration.
+            low, high = float(np.percentile(frame.pixels, 20)), float(frame.pixels.max())
+            normalized = np.clip((frame.pixels - low) / max(high - low, 1e-12), 0, 1)
+            threshold = .135
         else:
             normalized = np.clip(frame.pixels / frame.full_scale, 0, 1)
             threshold = .135
