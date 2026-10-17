@@ -238,7 +238,7 @@ def fit_beam(frame: Frame, selection=None, settings: FitSettings = DEFAULT_SETTI
     elif not solution.success or minor < 2 or holes > .20 or (not bimodal and (rms > .04 or coverage < .80 or longest_gap > 5 or missing > .15)):
         valid, reason = False, "明显遮挡、边界不足或拟合不可靠，暂停测量"
     if scale is None:
-        valid, reason = False, "预览定位圈；饱和与数据处理未验证 · " + reason
+        reason = "预览定位圈；饱和与数据处理未验证 · " + reason
     selected_cx, selected_cy = (cx, cy) if settings.center_mode == "boundary" else (area_cx, area_cy)
     return BeamFit(frame.frame_id, selected_cx + x0, selected_cy + y0, major, minor, angle,
                    peak, float(background.mean()), rms, saturated_fraction, valid, reason, roi,

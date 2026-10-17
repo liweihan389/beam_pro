@@ -27,10 +27,12 @@ namespace BeamicPro.Bridge
         public string bitsPerPixelPath { get; set; } = "ResultsPriorityFrame.OriginalBpp";
         public string gammaPath { get; set; } = "";
         public bool frameIdentityVerified { get; set; } = false;
+        public bool callbackSnapshotVerified { get; set; } = false;
+        public bool liveSourceVerified { get; set; } = false;
+        public bool threadModelVerified { get; set; } = false;
         public string[] coordinatePaths { get; set; } = new[] {
             "ResultsPriorityFrame.Width", "ResultsPriorityFrame.Height", "ResultsPriorityFrame.OriginalBpp",
-            "ResultsPriorityFrame.IsBaselineCalibrated", "ResultsPriorityFrame.IsFrameCalibrated",
-            "ResultsPriorityFrame.BaseLineOffset" };
+            "ResultsPriorityFrame.IsBaselineCalibrated", "ResultsPriorityFrame.IsFrameCalibrated" };
         public double fullScale { get; set; } = 0;
         public bool saturationVerified { get; set; } = false;
         public bool frameExposureVerified { get; set; } = false;
@@ -48,6 +50,9 @@ namespace BeamicPro.Bridge
         private readonly JavaScriptSerializer json = new JavaScriptSerializer();
         private readonly object outputLock = new object();
         private readonly object sdkLock = new object();
+        private readonly SnapshotGate gate = new SnapshotGate();
+        private readonly SnapshotMailbox mailbox = new SnapshotMailbox();
+        private readonly object reportLock = new object();
         private readonly AutoResetEvent newFrame = new AutoResetEvent(false);
         private readonly TextWriter output;
         private object app, frameEvents;
@@ -59,7 +64,12 @@ namespace BeamicPro.Bridge
         private long epoch, sequence;
         private string lastVendorId;
         private readonly Queue<object> frameSamples = new Queue<object>();
-        private long frameEventCount, duplicateFrames, inconsistentFrames;
+        private long frameEventCount, duplicateFrames;
+        private long controlGeneration, acceptedSnapshots, rateSkipped, gateSkipped, snapshotErrors, nextAcceptTicks;
+        private string pendingError;
+        private double? settingExposureUs;
+        private string settingReadUtc;
+        private double lastCallbackMs, lastCopyMs, lastPublishMs;
         private string verifiedVersion;
         private MemoryMappedFile map;
         private MemoryMappedViewAccessor view;
@@ -73,7 +83,6 @@ namespace BeamicPro.Bridge
         private bool previousAutoX;
         private bool canRestoreAutoX;
         private double originalExposure;
-        private int consecutiveErrors;
         private Dictionary<string, object> capabilities;
         private string originalSource;
         private bool numericReported;
@@ -117,7 +126,7 @@ namespace BeamicPro.Bridge
                         && !String.IsNullOrEmpty(profile.verifiedForSource)
                         && profile.verifiedForSource == Convert.ToString(PathValue("DataSource.DataSource"), CultureInfo.InvariantCulture)
                         && profile.verifiedBitsPerPixel > 0
-                        && profile.frameIdentityVerified
+                        && profile.callbackSnapshotVerified && profile.liveSourceVerified && profile.threadModelVerified
                         && Convert.ToInt32(PathValue(profile.bitsPerPixelPath)) == profile.verifiedBitsPerPixel
                         && !String.IsNullOrEmpty(profile.gammaPath)
                         && Math.Abs(Number(PathValue(profile.gammaPath)) - 1) < 0.000001;
@@ -151,6 +160,8 @@ namespace BeamicPro.Bridge
             var type = assemblies.SelectMany(a => a.GetTypes()).FirstOrDefault(t => t.Name == "AutomatedBeamMic");
             if (type == null) throw new TypeLoadException("AutomatedBeamMic is not exposed by these assemblies");
             app = Activator.CreateInstance(type, profile.instanceName, true);
+            // Before event subscription, establish a stable state for discovery.
+            Invoke(PathValue("DataSource"), "Stop");
             var eventType = assemblies.SelectMany(a => a.GetTypes()).FirstOrDefault(t => t.Name == "AutomationFrameEvents");
             if (eventType == null) throw new TypeLoadException("AutomationFrameEvents is unavailable");
             frameEvents = Activator.CreateInstance(eventType, PathValue(profile.framePath));
@@ -168,7 +179,7 @@ namespace BeamicPro.Bridge
                 ["numeric_images"] = false, ["frame_ids"] = false, ["ready"] = false,
                 ["members"] = DiscoverMembers(), ["diagnostics"] = Diagnostics(),
                 ["preview_only"] = true,
-                ["note"] = "UniqueKey is a candidate frame marker until runtime/vendor verification. Preview brightness is not a saturation calibration."
+                ["note"] = "Snapshots are owned within callbacks. Software sequences are not hardware frame IDs; live provenance, callback and exposure contracts still require verification."
             };
             try
             {
@@ -177,6 +188,8 @@ namespace BeamicPro.Bridge
                 report["maximum_us"] = Number(Egb("RangeMax")) * unitToUs;
                 report["step_us"] = Math.Max(Number(Egb("Increment")) * unitToUs, 0.000001);
                 originalExposure = Number(Egb("Get"));
+                settingExposureUs = originalExposure * unitToUs;
+                settingReadUtc = DateTime.UtcNow.ToString("o");
                 var egbType = PathValue("EGB").GetType();
                 exposureControl = egbType.GetMethods().Concat(egbType.GetInterfaces().SelectMany(i => i.GetMethods()))
                     .Any(m => m.Name == "Set" && m.GetParameters().Length == 2);
@@ -197,7 +210,7 @@ namespace BeamicPro.Bridge
         private Dictionary<string, string[]> DiscoverMembers()
         {
             var result = new Dictionary<string, string[]>();
-            foreach (var name in new[] { "", profile.framePath, "FrameInfoResults", "EGB", "Calibration", "DataSource",
+            foreach (var name in new[] { "", profile.framePath, "FrameInfoResults", "FrameBuffer", "EGB", "Calibration", "DataSource",
                 "ResultsPriorityFrame.FrameData", "ResultsPriorityFrame.CalibratedData", "ResultsPriorityFrame.Calibration", "OpticalScale" })
             {
                 try {
@@ -212,138 +225,179 @@ namespace BeamicPro.Bridge
         {
             var paths = new[] { profile.framePath, profile.imagePath, profile.widthPath, profile.heightPath,
                 profile.idPath, profile.frameExposurePath, profile.bitsPerPixelPath, profile.gammaPath,
-                "ResultsPriorityFrame.HasData", "ResultsPriorityFrame.CalibratedData", "ResultsPriorityFrame.FrameData",
+                "ResultsPriorityFrame.HasData", "ResultsPriorityFrame.CalibratedData", "ResultsPriorityFrame.FrameData", "ResultsPriorityFrame.BaseLineOffset",
                 "Calibration.Status", "DataSource.Status" }.Concat(profile.coordinatePaths ?? new string[0]);
             return new {
                 fields = VendorAccess.Describe(app, paths),
-                methods = VendorAccess.Methods(app, new[] { profile.framePath, "EGB", "DataSource", "Calibration" }),
+                methods = VendorAccess.Methods(app, new[] { profile.framePath, "FrameBuffer", "EGB", "DataSource", "Calibration" }),
                 new_frame_events = Interlocked.Read(ref frameEventCount),
-                duplicate_markers = duplicateFrames, inconsistent_snapshots = inconsistentFrames,
+                duplicate_markers = duplicateFrames,
+                snapshot_consistency = "callback ownership requires installed-version verification; UniqueKey is not an atomicity check",
+                accepted_snapshots = acceptedSnapshots, rate_skipped = rateSkipped, gate_skipped = gateSkipped,
+                replaced_pending = mailbox.Replaced, snapshot_errors = snapshotErrors,
+                callback_ms = lastCallbackMs, copy_ms = lastCopyMs, publish_ms = lastPublishMs,
+                control_generation = controlGeneration,
+                probe_scope = "Frame getter diagnostics are collected with the data source stopped; a running source is resumed afterward",
                 frame_samples = frameSamples.ToArray(), images_saved = false,
                 missing_requirements = new[] {
-                    !profile.frameIdentityVerified ? "Frame marker semantics and coordinate/processing stability unverified" : null,
+                    !(profile.callbackSnapshotVerified && profile.liveSourceVerified && profile.threadModelVerified) ? "Callback consistency, live-frame provenance and SDK thread model unverified" : null,
                     !(Verified && profile.frameExposureVerified && profile.frameExposureToUs > 0) ? "Frame-associated exposure unverified" : null,
                     !(Verified && profile.saturationVerified && profile.fullScale > 0) ? "Linear image stage and saturation scale unverified" : null
                 }.Where(v => v != null).ToArray()
             };
         }
-        private void FrameReady() {
-            Interlocked.Increment(ref frameEventCount);
-            if (!stopped && !paused) newFrame.Set();
+        private object FrameValue(object frame, string path) {
+            string prefix = profile.framePath + ".";
+            return path.StartsWith(prefix, StringComparison.Ordinal) ? VendorAccess.Value(frame, path.Substring(prefix.Length)) : PathValue(path);
         }
-        private string FrameMarker() {
-            try { return VendorAccess.Token(PathValue(profile.idPath)); }
-            catch { return null; } // Untyped/missing markers allow preview only; diagnostics retain the error/type.
+
+        private void FrameReady()
+        {
+            long eventId = Interlocked.Increment(ref frameEventCount);
+            if (stopped || paused || !gate.TryEnter()) { Interlocked.Increment(ref gateSkipped); return; }
+            long started = Stopwatch.GetTimestamp();
+            try {
+                if (started < Interlocked.Read(ref nextAcceptTicks)) { Interlocked.Increment(ref rateSkipped); return; }
+                Interlocked.Exchange(ref nextAcceptTicks, started + (long)(Stopwatch.Frequency / fps));
+                long generation = Interlocked.Read(ref controlGeneration);
+                // Read all frame fields from one captured object, before returning to the vendor.
+                object frame = PathValue(profile.framePath);
+                int width = Convert.ToInt32(FrameValue(frame, profile.widthPath));
+                int height = Convert.ToInt32(FrameValue(frame, profile.heightPath));
+                Array vendorPixels = FrameValue(frame, profile.imagePath) as Array;
+                long copyStarted = Stopwatch.GetTimestamp();
+                Array owned = NativeRaster.Own(vendorPixels, width, height);
+                double copyMs = NativeRaster.Ms(Stopwatch.GetTimestamp() - copyStarted);
+                string marker = null;
+                try { marker = VendorAccess.Token(FrameValue(frame, profile.idPath)); } catch { }
+                if (marker != null && marker == lastVendorId) Interlocked.Increment(ref duplicateFrames);
+                lastVendorId = marker; // Diagnostic only. Identical pixels/keys do not suppress events.
+                string source = Convert.ToString(PathValue("DataSource.DataSource"), CultureInfo.InvariantCulture);
+                string status = Convert.ToString(PathValue("DataSource.Status"), CultureInfo.InvariantCulture);
+                bool complete = true;
+                var coordinates = new List<string> { "source=" + source, "image=" + profile.imagePath, "width=" + width, "height=" + height };
+                foreach (string path in profile.coordinatePaths ?? new string[0]) {
+                    try { coordinates.Add(path + "=" + Convert.ToString(FrameValue(frame, path), CultureInfo.InvariantCulture)); }
+                    catch { complete = false; coordinates.Add(path + "=?"); }
+                }
+                double? exposure = null;
+                if (!String.IsNullOrWhiteSpace(profile.frameExposurePath) && profile.frameExposureToUs > 0) {
+                    try {
+                        double value = Number(FrameValue(frame, profile.frameExposurePath)) * profile.frameExposureToUs;
+                        if (Finite(value) && value > 0) exposure = value;
+                    } catch { }
+                }
+                bool verified = Verified;
+                bool quantitative = verified && complete && String.Equals(status, "RUNNING", StringComparison.OrdinalIgnoreCase)
+                    && exposure.HasValue && profile.frameExposureVerified && profile.saturationVerified
+                    && Finite(profile.fullScale) && profile.fullScale > 0;
+                long identity = Interlocked.Increment(ref acceptedSnapshots);
+                double callbackMs = NativeRaster.Ms(Stopwatch.GetTimestamp() - started);
+                var snapshot = new NativeSnapshot {
+                    Pixels = owned, Width = width, Height = height, EventId = eventId, SnapshotId = identity,
+                    Generation = generation, CopyMs = copyMs, CallbackMs = callbackMs, Marker = marker,
+                    Source = source, Status = status, Coordinate = String.Join("|", coordinates),
+                    Quantitative = quantitative, ExposureUs = exposure, ExposureEpoch = epoch,
+                    Metadata = new Dictionary<string, object> {
+                        ["assembly_version"] = verifiedVersion, ["processing"] = profile.processingDescription,
+                        ["vendor_frame_id"] = marker, ["event_id"] = eventId, ["snapshot_id"] = identity,
+                        ["control_generation"] = generation, ["source"] = source, ["source_status"] = status,
+                        ["frame_identity_verified"] = quantitative, ["software_sequence_is_hardware_id"] = false,
+                        ["provenance"] = quantitative ? "verified_live_callback" : "unverified_vendor_callback",
+                        ["callback_ms"] = callbackMs, ["copy_ms"] = copyMs,
+                        ["exposure_setting_us"] = settingExposureUs, ["exposure_setting_read_utc"] = settingReadUtc,
+                        ["exposure_setting_source"] = "last_control_query; not frame-associated exposure",
+                        ["preview_only"] = !quantitative, ["simulated"] = false
+                    }
+                };
+                if (generation != Interlocked.Read(ref controlGeneration) || stopped || paused) return;
+                mailbox.Put(snapshot);
+                newFrame.Set();
+            } catch (Exception error) {
+                Interlocked.Increment(ref snapshotErrors);
+                Interlocked.Exchange(ref pendingError, error.GetBaseException().Message);
+                newFrame.Set(); // Only the worker reports errors; never write pipes from a callback.
+            } finally { gate.Leave(); }
         }
 
         private void ReadFrames()
         {
-            var clock = Stopwatch.StartNew();
-            double lastRead = -100;
-            while (!stopped)
-            {
-                if (!newFrame.WaitOne(500) || paused) continue;
-                var sleep = 1 / fps - (clock.Elapsed.TotalSeconds - lastRead);
-                if (sleep > 0) Thread.Sleep((int)(sleep * 1000));
-                if (stopped || paused) continue;
-                try
-                {
-                    Dictionary<string, object> descriptor;
-                    lock (sdkLock)
-                    {
-                        var before = FrameMarker();
-                        if (before != null && before == lastVendorId) {
-                            duplicateFrames++;
-                            // A constant object key might not identify frames. Until verified,
-                            // deliver event-triggered preview without claiming unique camera frames.
-                            if (profile.frameIdentityVerified) continue;
+            while (!stopped) {
+                newFrame.WaitOne(500);
+                string error = Interlocked.Exchange(ref pendingError, null);
+                if (error != null) Emit(new { type = "error", message = error, fatal = false });
+                NativeSnapshot snapshot = mailbox.Take();
+                if (snapshot == null || snapshot.Generation != Interlocked.Read(ref controlGeneration) || paused) continue;
+                try {
+                    long started = Stopwatch.GetTimestamp();
+                    double[] range = NativeRaster.Range(snapshot.Pixels);
+                    byte[] bytes = new byte[Buffer.ByteLength(snapshot.Pixels)];
+                    Buffer.BlockCopy(snapshot.Pixels, 0, bytes, 0, bytes.Length);
+                    if (map == null || bytes.Length > capacity) Allocate(bytes.Length);
+                    slot = (slot + 1) % 3;
+                    long offset = slot * slotSpan;
+                    sequence += 2;
+                    view.Write(offset, sequence - 1);
+                    Thread.MemoryBarrier();
+                    view.WriteArray(offset + 8, bytes, 0, bytes.Length);
+                    Thread.MemoryBarrier();
+                    view.Write(offset, sequence);
+                    snapshot.Metadata["wire_dtype"] = NativeRaster.Dtype(snapshot.Pixels.GetType().GetElementType());
+                    snapshot.Metadata["publish_ms"] = NativeRaster.Ms(Stopwatch.GetTimestamp() - started);
+                    var descriptor = new Dictionary<string, object> {
+                        ["map_name"] = mapName, ["map_size"] = 3L * slotSpan,
+                        ["offset"] = offset, ["sequence"] = sequence, ["shape"] = new[] { snapshot.Height, snapshot.Width },
+                        ["dtype"] = snapshot.Metadata["wire_dtype"], ["control_generation"] = snapshot.Generation,
+                        ["preview_only"] = !snapshot.Quantitative,
+                        ["frame"] = new Dictionary<string, object> {
+                            ["frame_id"] = snapshot.SnapshotId, ["received_ns"] = 0,
+                            ["exposure_us"] = snapshot.Quantitative ? (object)snapshot.ExposureUs.Value : null,
+                            ["exposure_epoch"] = snapshot.ExposureEpoch, ["coordinate_key"] = snapshot.Coordinate,
+                            ["full_scale"] = snapshot.Quantitative ? (object)profile.fullScale : null,
+                            ["pixel_pitch_um"] = snapshot.Quantitative && profile.pixelPitchUm > 0 ? (object)profile.pixelPitchUm : null,
+                            ["timestamp_source"] = "host_transport_receive_only",
+                            ["exposure_verified"] = snapshot.Quantitative, ["saturation_verified"] = snapshot.Quantitative,
+                            ["metadata"] = snapshot.Metadata
                         }
-                        int width = Convert.ToInt32(PathValue(profile.widthPath)), height = Convert.ToInt32(PathValue(profile.heightPath));
-                        var array = PathValue(profile.imagePath) as Array;
-                        var values = VendorAccess.Raster(array, width, height);
-                        bool coordinatesComplete = true;
-                        var coordinate = new List<string> { "source=" + SafeValue("DataSource.DataSource"),
-                            "image=" + profile.imagePath, "width=" + width, "height=" + height };
-                        foreach (var path in profile.coordinatePaths ?? new string[0]) {
-                            try { coordinate.Add(path + "=" + Convert.ToString(PathValue(path), CultureInfo.InvariantCulture)); }
-                            catch { coordinatesComplete = false; coordinate.Add(path + "=?"); }
-                        }
-                        double? exposureUs = null;
-                        if (!String.IsNullOrWhiteSpace(profile.frameExposurePath) && profile.frameExposureToUs > 0) {
-                            try {
-                                double value = Number(PathValue(profile.frameExposurePath)) * profile.frameExposureToUs;
-                                if (Finite(value) && value > 0) exposureUs = value;
-                            } catch { /* Missing quantitative metadata does not block preview. */ }
-                        }
-                        var after = FrameMarker();
-                        if (before != after) { inconsistentFrames++; continue; }
-                        bool verified = Verified;
-                        bool quantitative = verified && after != null && coordinatesComplete && exposureUs.HasValue && profile.frameExposureVerified
-                            && profile.saturationVerified && Finite(profile.fullScale) && profile.fullScale > 0;
-                        frameSamples.Enqueue(new { marker = after, elapsed_ms = clock.ElapsedMilliseconds,
-                            width, height, minimum = values.Min(), maximum = values.Max(), frame_exposure_us = exposureUs,
-                            preview_only = !quantitative });
+                    };
+                    Dictionary<string, object> changedCapabilities = null;
+                    lock (reportLock) {
+                        bool changed = !numericReported || !Equals(capabilities["preview_only"], !snapshot.Quantitative)
+                            || !Equals(capabilities["ready"], snapshot.Quantitative && manualExposureOwned);
+                        frameSamples.Enqueue(new { event_id = snapshot.EventId, snapshot_id = snapshot.SnapshotId,
+                            marker = snapshot.Marker, width = snapshot.Width, height = snapshot.Height, source_status = snapshot.Status,
+                            control_generation = snapshot.Generation,
+                            minimum = range[0], maximum = range[1], callback_ms = snapshot.CallbackMs, copy_ms = snapshot.CopyMs,
+                            frame_exposure_us = snapshot.ExposureUs, preview_only = !snapshot.Quantitative });
                         while (frameSamples.Count > 20) frameSamples.Dequeue();
-                        if (map == null || values.Length > capacity) Allocate(values.Length);
-                        slot = (slot + 1) % 3;
-                        long offset = slot * slotSpan;
-                        sequence += 2;
-                        view.Write(offset, sequence - 1);
-                        Thread.MemoryBarrier();
-                        view.WriteArray(offset + 8, values, 0, values.Length);
-                        Thread.MemoryBarrier();
-                        view.Write(offset, sequence);
-                        lastVendorId = after;
-                        descriptor = new Dictionary<string, object> {
-                            ["map_name"] = mapName, ["map_size"] = 3L * slotSpan,
-                            ["offset"] = offset, ["sequence"] = sequence, ["shape"] = new[] { height, width },
-                            ["preview_only"] = !quantitative,
-                            ["frame"] = new Dictionary<string, object> {
-                                ["frame_id"] = sequence / 2, ["received_ns"] = 0,
-                                ["exposure_us"] = quantitative ? (object)exposureUs.Value : null, ["exposure_epoch"] = epoch,
-                                ["coordinate_key"] = String.Join("|", coordinate), ["full_scale"] = quantitative ? (object)profile.fullScale : null,
-                                ["pixel_pitch_um"] = quantitative && profile.pixelPitchUm > 0 ? (object)profile.pixelPitchUm : null,
-                                ["timestamp_source"] = "host_receive_only", ["exposure_verified"] = quantitative,
-                                ["saturation_verified"] = quantitative,
-                                ["metadata"] = new { assembly_version = verifiedVersion, processing = profile.processingDescription,
-                                    vendor_frame_id = after, frame_identity_verified = verified && profile.frameIdentityVerified,
-                                    preview_only = !quantitative, simulated = false }
-                            }
-                        };
-                        bool changed = !numericReported || !Equals(capabilities["preview_only"], !quantitative);
+                        lastCallbackMs = snapshot.CallbackMs; lastCopyMs = snapshot.CopyMs;
+                        lastPublishMs = NativeRaster.Ms(Stopwatch.GetTimestamp() - started);
                         numericReported = true;
                         capabilities["numeric_images"] = true;
-                        capabilities["frame_ids"] = after != null && verified && profile.frameIdentityVerified;
-                        capabilities["frame_marker_available"] = after != null;
-                        capabilities["source"] = SafeValue("DataSource.DataSource");
-                        capabilities["profile_verified"] = verified;
-                        capabilities["saturation_verified"] = quantitative;
-                        capabilities["exposure_verified"] = quantitative;
-                        capabilities["preview_only"] = !quantitative;
-                        capabilities["ready"] = quantitative && exposureControl && manualExposureOwned;
-                        if (changed) {
-                            capabilities["diagnostics"] = Diagnostics();
-                            Emit(new { type = "capabilities", report = capabilities });
-                        }
+                        capabilities["preview_only"] = !snapshot.Quantitative;
+                        capabilities["profile_verified"] = snapshot.Quantitative;
+                        capabilities["exposure_verified"] = snapshot.Quantitative;
+                        capabilities["saturation_verified"] = snapshot.Quantitative;
+                        capabilities["frame_ids"] = snapshot.Quantitative;
+                        capabilities["hardware_frame_ids"] = false;
+                        capabilities["ready"] = snapshot.Quantitative && manualExposureOwned;
+                        if (changed) changedCapabilities = new Dictionary<string, object>(capabilities);
                     }
-                    lastRead = clock.Elapsed.TotalSeconds;
-                    consecutiveErrors = 0;
+                    // No SDK access in this worker. Metadata belongs to the completed callback.
+                    if (snapshot.Generation != Interlocked.Read(ref controlGeneration) || paused) continue;
+                    if (changedCapabilities != null) Emit(new { type = "capabilities", report = changedCapabilities });
                     Emit(new { type = "frame", descriptor });
-                }
-                catch (Exception error)
-                {
-                    consecutiveErrors++;
-                    if (consecutiveErrors == 1 || consecutiveErrors % 20 == 0)
-                        Emit(new { type = "error", message = error.GetBaseException().Message, fatal = false });
+                } catch (Exception failure) {
+                    Emit(new { type = "error", message = failure.GetBaseException().Message, fatal = false });
                 }
             }
         }
 
-        private void Allocate(int pixels)
+        private void Allocate(int bytes)
         {
             if (map != null) { view.Dispose(); map.Dispose(); }
-            capacity = pixels;
-            slotSpan = 8L + ((pixels * 4L + 7) / 8) * 8;
+            capacity = bytes;
+            slotSpan = 8L + ((bytes + 7L) / 8) * 8;
             mapName = "Local\\BeamicPro_" + Guid.NewGuid().ToString("N");
             map = MemoryMappedFile.CreateNew(mapName, 3L * slotSpan);
             view = map.CreateViewAccessor();
@@ -351,6 +405,40 @@ namespace BeamicPro.Bridge
         }
 
         public object Command(Dictionary<string, object> command)
+        {
+            string method = Convert.ToString(command["method"]);
+            if (method == "set_rate") return CommandCore(command);
+            lock (sdkLock) {
+                bool wasPaused = paused;
+                paused = true;
+                long generation = Interlocked.Increment(ref controlGeneration);
+                mailbox.Clear();
+                Emit(new { type = "control_state", generation, phase = "transition", reason = method });
+                gate.Close();
+                bool resume = !wasPaused;
+                try {
+                    // Probe raster getters only while stopped, as required by official examples.
+                    if (method == "probe" && resume) Invoke(PathValue("DataSource"), "Stop");
+                    object result;
+                    lock (reportLock) {
+                        result = CommandCore(command);
+                        if (ReferenceEquals(result, capabilities)) result = new Dictionary<string, object>(capabilities);
+                    }
+                    if (method == "probe" && resume) Invoke(PathValue("DataSource"), "Start");
+                    if (method != "start" && method != "stop" && method != "shutdown") paused = wasPaused;
+                    return result;
+                } catch {
+                    paused = true;
+                    throw;
+                } finally {
+                    Interlocked.Exchange(ref nextAcceptTicks, 0);
+                    Emit(new { type = "control_state", generation, phase = paused || stopped ? "paused" : "accepting", reason = method });
+                    if (!paused && !stopped) gate.Open();
+                }
+            }
+        }
+
+        private object CommandCore(Dictionary<string, object> command)
         {
             string method = Convert.ToString(command["method"]);
             if (method == "set_rate") {
@@ -387,9 +475,12 @@ namespace BeamicPro.Bridge
                     capabilities["exposure_verified"] = quantitative && profile.frameExposureVerified;
                     capabilities["ready"] = quantitative && exposureControl && manualExposureOwned;
                     capabilities["members"] = DiscoverMembers();
-                    capabilities["diagnostics"] = Diagnostics();
+                    capabilities["numeric_images"] = numericReported;
+                    lock (reportLock) { capabilities["diagnostics"] = Diagnostics(); }
                     try {
-                        capabilities["current_exposure_setting_us"] = Number(Egb("Get")) * unitToUs;
+                        settingExposureUs = Number(Egb("Get")) * unitToUs;
+                        settingReadUtc = DateTime.UtcNow.ToString("o");
+                        capabilities["current_exposure_setting_us"] = settingExposureUs;
                         capabilities["exposure_setting_note"] = "Current setting only; not frame-associated exposure";
                     } catch { capabilities["current_exposure_setting_us"] = null; }
                     Emit(new { type = "capabilities", report = capabilities });
@@ -445,6 +536,8 @@ namespace BeamicPro.Bridge
                     manualExposureOwned = true;
                     Egb("Set", native);
                     epoch++;
+                    settingExposureUs = Number(Egb("Get")) * unitToUs;
+                    settingReadUtc = DateTime.UtcNow.ToString("o");
                     return new { exposure_us = Number(Egb("Get")) * unitToUs, epoch };
                 }
             }
@@ -453,12 +546,19 @@ namespace BeamicPro.Bridge
 
         public void Dispose()
         {
+            paused = true;
+            gate.Close(); // Timeout throws before touching resources that a callback may still use.
             stopped = true;
+            mailbox.Clear();
             newFrame.Set();
-            reader?.Join(1500);
+            if (reader != null && !reader.Join(3000)) throw new TimeoutException("Snapshot publisher did not stop; bridge isolated");
+            if (frameEvents != null && frameDelegate != null) {
+                frameEvents.GetType().GetEvent("OnNewFrame")?.RemoveEventHandler(frameEvents, frameDelegate);
+            }
             lock (sdkLock)
             {
                 if (app != null) {
+                    try { Invoke(PathValue("DataSource"), "Stop"); } catch { }
                     try {
                         if (manualExposureOwned && Equals(originalSource, SafeValue("DataSource.DataSource"))) Egb("Set", originalExposure);
                         if (canRestoreAutoX && Equals(originalSource, SafeValue("DataSource.DataSource")) && Convert.ToBoolean(PathValue("Calibration.AutoXIsEnabled")) != previousAutoX)

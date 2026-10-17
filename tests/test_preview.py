@@ -36,7 +36,7 @@ def test_unknown_exposure_and_scale_cannot_be_promoted_to_measurement():
     fit = fit_beam(frame)
     np.testing.assert_allclose(fit.center, [150, 120], atol=.15)
     assert fit.radius_minor > 10
-    assert not fit.valid
+    assert fit.valid  # Geometric preview is distinct from quantitative readiness.
     assert "预览" in fit.reason
 
 
@@ -60,10 +60,10 @@ def test_preview_raster_reaches_view_and_localization_but_not_plugins(applicatio
         assert window.last_frame is frame
         assert not window.view.image_item.pixmap().isNull()
         assert any(item.data(0) == "circle_center" for item in window.view.items)
-        assert not window.last_fit.valid and not window.capture_ready
+        assert window.last_fit.valid and not window.capture_ready
         assert window.fit_rate.fps == 0
         assert "曝光未知" in window.exposure_label.text()
-        assert not window.fixed_circle_button.isEnabled()
+        assert window.fixed_circle_button.isEnabled()
         frame2 = preview(2, (170, 130))
         window.frames.put((generation, frame2))
         pump_until(application, lambda: window.last_fit.frame_id == 2)
@@ -144,6 +144,7 @@ def test_report_refreshes_runtime_diagnostics_before_writing(application, tmp_pa
         report = json.loads(path.read_text())
         assert commands == ["probe"]
         assert report["capabilities"]["diagnostics"]["frame_samples"][0]["marker"] == "new"
-        assert report["application_version"] == "0.5.1"
+        from beamic_pro import __version__
+        assert report["application_version"] == __version__
     finally:
         window.close()

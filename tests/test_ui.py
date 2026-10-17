@@ -60,8 +60,15 @@ def test_fixed_reference_does_not_freeze_measurement_or_plugin_targets(applicati
         assert window.exposure.state.stable
         window.connect_centers_input.setChecked(True)
         window.track_center_input.setChecked(False)
-        pump(application, .15)
-        links = [item for item in window.view.items if item.data(0) == "center_link"]
+        # Between new preview arrival and its fit, the previous centre is reference
+        # only. Inspect the next fresh result rather than an arbitrary refresh.
+        deadline = time.monotonic() + 2
+        links = []
+        while time.monotonic() < deadline and not links:
+            application.processEvents()
+            links = [item for item in window.view.items if item.data(0) == "center_link"]
+            if not links:
+                time.sleep(.002)
         assert len(links) == 1
         assert not any(item.data(0) == "live_center" for item in window.view.items)
         assert links[0].line().x1() == fixed.boundary_center[0]

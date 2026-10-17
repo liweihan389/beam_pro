@@ -30,6 +30,9 @@ class BridgeClient:
         self.maps = {}
         self.map_lock = threading.Lock()
         self.capabilities = {}
+        self.control_generation = 0
+        self.receive_count = 0
+        self.copy_times_ms = []
         self.closed = False
         self._reader = threading.Thread(target=self._read, daemon=True)
         self._reader.start()
@@ -45,6 +48,11 @@ class BridgeClient:
             for line in self.process.stdout:
                 try:
                     message = json.loads(line)
+                    if message.get("type") == "control_state":
+                        self.control_generation = max(self.control_generation, int(message["generation"]))
+                    if message.get("type") == "frame":
+                        self.receive_count += 1
+                        message["descriptor"]["_host_received_ns"] = time.monotonic_ns()
                     if message.get("type") == "reply":
                         result = self.pending.get(message["id"])
                         if result:
@@ -60,6 +68,7 @@ class BridgeClient:
                 self.event_callback({"type": "error", "message": "BeamMic 桥接已退出"})
 
     def command(self, method, **values):
+        timeout = values.pop("_timeout", 10)
         with self.lock:
             self.command_id += 1
             identity = self.command_id
@@ -73,7 +82,7 @@ class BridgeClient:
                 self.pending.pop(identity, None)
                 raise RuntimeError("桥接连接已断开") from error
         try:
-            reply = result.get(timeout=10)
+            reply = result.get(timeout=timeout)
             if not reply.get("ok"):
                 raise RuntimeError(reply.get("error", "桥接操作失败"))
             return reply.get("result", {})
@@ -87,6 +96,10 @@ class BridgeClient:
             return self._read_frame(descriptor)
 
     def _read_frame(self, descriptor):
+        if int(descriptor.get("control_generation", 0)) < getattr(self, "control_generation", 0):
+            return None
+        received_ns = int(descriptor.get("_host_received_ns", time.monotonic_ns()))
+        copy_started = time.monotonic_ns()
         name = descriptor["map_name"]
         if name not in self.maps:
             for old in self.maps.values():
@@ -99,13 +112,23 @@ class BridgeClient:
         if int(header[0]) != expected or expected % 2:
             del header
             return None
-        pixels = np.ndarray(tuple(descriptor["shape"]), dtype=np.float32, buffer=mapping, offset=offset + 8).copy()
+        dtype = np.dtype(descriptor.get("dtype", "<f4"))
+        if dtype.kind not in "fiu" or dtype.itemsize not in (1, 2, 4, 8):
+            raise ValueError("桥接像素类型无效")
+        pixels = np.ndarray(tuple(descriptor["shape"]), dtype=dtype, buffer=mapping, offset=offset + 8).copy()
         good = int(header[0]) == expected
         del header
         if not good:
             return None
         metadata = dict(descriptor["frame"])
-        metadata["received_ns"] = time.monotonic_ns()
+        metadata["received_ns"] = received_ns
+        duration_ms = (time.monotonic_ns() - copy_started) / 1e6
+        if hasattr(self, "copy_times_ms"):
+            self.copy_times_ms.append(duration_ms)
+            del self.copy_times_ms[:-200]
+        metadata["metadata"] = {**metadata.get("metadata", {}),
+                                "host_mapping_copy_ms": duration_ms,
+                                "transport_received_ns": received_ns}
         if descriptor.get("preview_only"):
             return PreviewFrame(pixels=pixels, **metadata)
         return Frame(pixels=pixels, **metadata)
@@ -119,7 +142,7 @@ class BridgeClient:
     def close(self):
         self.closed = True
         try:
-            self.command("shutdown")
+            self.command("shutdown", _timeout=1)
         except RuntimeError:
             pass
         try:

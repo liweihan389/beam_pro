@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import math
+import time
+from collections import deque
 
 import numpy as np
 from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPen, QPixmap
+from PySide6.QtGui import QColor, QImage, QPen, QPixmap, QTransform
 from PySide6.QtWidgets import QGraphicsItem, QGraphicsScene, QGraphicsView
 
 
@@ -35,22 +37,35 @@ class BeamView(QGraphicsView):
         self.plugin_shapes = []
         self.track_center = True
         self.connect_centers = False
+        self.fit_current = True
+        self.fit_age_s = 0.0
+        self.fit_failed = False
+        self.preview_only = False
+        self.render_times_ms = deque(maxlen=200)
+        self.render_shape = None
 
     def set_image(self, frame, fit=None):
+        started = time.monotonic()
         fit = fit if fit is not None else self.current_fit
-        if fit and fit.amplitude > 0:
-            yy, xx = np.ogrid[:frame.shape[0], :frame.shape[1]]
+        self.preview_only = frame.full_scale is None
+        h, w = frame.shape
+        # Sample for the display only. Scene coordinates always remain original pixels.
+        maximum = max(640, min(1600, self.viewport().width() * 2))
+        stride = max(1, math.ceil(w / maximum))
+        pixels = frame.pixels[::stride, ::stride]
+        if fit and fit.amplitude > 0 and fit.frame_id == frame.frame_id:
+            yy, xx = np.ogrid[:h:stride, :w:stride]
             background = (fit.background_origin if fit.background_origin is not None else fit.background)
             background = background + fit.background_slope_x * xx + fit.background_slope_y * yy
-            normalized = np.clip((frame.pixels - background) / fit.amplitude, 0, 1)
+            normalized = np.clip((pixels - background) / fit.amplitude, 0, 1)
             threshold = fit.boundary_fraction
         elif frame.full_scale is None:
             # Display normalization is not a saturation or intensity calibration.
-            low, high = float(np.percentile(frame.pixels, 20)), float(frame.pixels.max())
-            normalized = np.clip((frame.pixels - low) / max(high - low, 1e-12), 0, 1)
+            low, high = float(np.percentile(pixels, 20)), float(pixels.max())
+            normalized = np.clip((pixels - low) / max(high - low, 1e-12), 0, 1)
             threshold = .135
         else:
-            normalized = np.clip(frame.pixels / frame.full_scale, 0, 1)
+            normalized = np.clip(pixels / frame.full_scale, 0, 1)
             threshold = .135
         # Blue begins at the selected relative intensity, independent of exposure.
         levels = [0., threshold * .3, threshold * .8, threshold,
@@ -60,14 +75,23 @@ class BeamView(QGraphicsView):
                             [20, 190, 220], [90, 210, 70], [255, 195, 25], [255, 255, 255]])
         rgb = np.stack([np.interp(normalized, levels, palette[:, channel]) for channel in range(3)], axis=-1)
         rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
-        h, w = frame.shape
-        image = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format.Format_RGB888).copy()
+        rh, rw = rgb.shape[:2]
+        self.render_shape = (rh, rw)
+        image = QImage(rgb.data, rw, rh, rgb.strides[0], QImage.Format.Format_RGB888).copy()
         self.image_item.setPixmap(QPixmap.fromImage(image))
+        self.image_item.setTransform(QTransform.fromScale(stride, stride))
         self.displayed_frame_id = frame.frame_id
         if self.dimensions != (w, h):
             self.dimensions = (w, h)
             self.setSceneRect(QRectF(0, 0, w, h))
             self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.render_times_ms.append((time.monotonic() - started) * 1000)
+
+    def set_fit_freshness(self, current, age_s, failed=False):
+        self.fit_current = bool(current and age_s <= 2)
+        self.fit_age_s = max(0., float(age_s))
+        self.fit_failed = bool(failed)
+        self.overlays(self.current_fit if age_s <= 2 else None, self.plugin_shapes)
 
     def overlays(self, fit=None, shapes=None):
         self.current_fit = fit
@@ -96,7 +120,7 @@ class BeamView(QGraphicsView):
                     item = self.scene().addLine(*segment, stroke)
                     item.setData(0, role)
                     self.items.append(item)
-        live_valid = bool(fit and fit.valid and fit.radius_minor > 0 and np.isfinite(fit.center).all())
+        live_valid = bool(self.fit_current and fit and fit.valid and fit.radius_minor > 0 and np.isfinite(fit.center).all())
         circle_fit = self.fixed_fit or fit
         if self.auto_circle and self.fixed_fit and self.connect_centers and live_valid:
             reference_x, reference_y = self.fixed_fit.boundary_center
@@ -108,10 +132,17 @@ class BeamView(QGraphicsView):
         if self.auto_circle and circle_fit and circle_fit.radius_minor > 0:
             x, y = circle_fit.boundary_center
             ellipse(x, y, circle_fit.radius_major, circle_fit.radius_minor, circle_fit.angle_rad,
-                    "#d5b4ff" if self.fixed_fit else ("#7ce5cb" if circle_fit.valid else "#f3ba62"),
-                    not circle_fit.valid)
+                    "#d5b4ff" if self.fixed_fit else ("#9aa9bd" if not self.fit_current else ("#f3ba62" if self.preview_only or not circle_fit.valid else "#7ce5cb")),
+                    not circle_fit.valid or (not self.fixed_fit and (not self.fit_current or self.preview_only)))
             cross(x, y, "#d5b4ff" if self.fixed_fit else ("#7ce5cb" if circle_fit.valid else "#f3ba62"),
                   "circle_center")
+            if not self.fixed_fit and not self.fit_current:
+                text = self.scene().addText(("识别失败 · " if self.fit_failed else "") + f"上次定位，距收帧 {self.fit_age_s:.2f} 秒")
+                text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+                text.setDefaultTextColor(QColor("#ffcc6e"))
+                text.setPos(x + 8, y + 8)
+                text.setData(0, "stale_fit")
+                self.items.append(text)
             if self.fixed_fit:
                 text = self.scene().addText("固定参考圈")
                 text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
@@ -179,7 +210,7 @@ class BeamView(QGraphicsView):
     def toggle_fixed_circle(self):
         if self.fixed_fit is not None:
             self.fixed_fit = None
-        elif self.auto_circle and self.current_fit and self.current_fit.valid:
+        elif self.auto_circle and self.fit_age_s <= 2 and not self.fit_failed and self.current_fit and self.current_fit.valid:
             self.fixed_fit = self.current_fit
         self.track_center, self.connect_centers = True, False
         self.overlays(self.current_fit, self.plugin_shapes)

@@ -10,7 +10,10 @@
   "bitsPerPixelPath": "ResultsPriorityFrame.OriginalBpp",
   "gammaPath": "",
   "frameIdentityVerified": false,
-  "coordinatePaths": ["ResultsPriorityFrame.Width", "ResultsPriorityFrame.Height", "ResultsPriorityFrame.OriginalBpp", "ResultsPriorityFrame.IsBaselineCalibrated", "ResultsPriorityFrame.IsFrameCalibrated", "ResultsPriorityFrame.BaseLineOffset"],
+  "callbackSnapshotVerified": false,
+  "liveSourceVerified": false,
+  "threadModelVerified": false,
+  "coordinatePaths": ["ResultsPriorityFrame.Width", "ResultsPriorityFrame.Height", "ResultsPriorityFrame.OriginalBpp", "ResultsPriorityFrame.IsBaselineCalibrated", "ResultsPriorityFrame.IsFrameCalibrated"],
   "fullScale": 0,
   "saturationVerified": false,
   "frameExposureVerified": false,
@@ -19,6 +22,6 @@
   "verifiedBitsPerPixel": 0,
   "frameExposureToUs": 0,
   "pixelPitchUm": 0,
-  "processingDescription": "preview only — frame identity, exposure association, coordinates, linearity and saturation remain unverified"
+  "processingDescription": "preview only; callback consistency, live provenance, SDK threading, exposure association, coordinates, linearity and saturation remain unverified"
 }
 

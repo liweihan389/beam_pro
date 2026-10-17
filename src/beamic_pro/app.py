@@ -35,12 +35,14 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSplitter,
+    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from .bridge_client import BridgeClient
+from .diagnostics import DiagnosticRecorder
 from .exposure import ExposureController
 from .fitting import FitSettings, fit_beam
 from .measurement import Capture
@@ -101,6 +103,7 @@ class Window(QMainWindow):
         self.signals.bridge_event.connect(self.bridge_event)
         self.signals.operation.connect(self.operation)
         self.pool = ThreadPoolExecutor(max_workers=3)
+        self.recorder = DiagnosticRecorder(lambda state: self.signals.operation.emit({"kind": "diagnostic_status", "state": state}))
         self.analyzer_stop = threading.Event()
         self.analyzer = threading.Thread(target=self.analyze, daemon=True)
         self.analyzer.start()
@@ -112,6 +115,11 @@ class Window(QMainWindow):
         self.last_frame = self.last_fit = None
         self.last_frame_ns = 0
         self.last_fit_ns = 0
+        self.last_good_fit = None
+        self.last_good_fit_ns = 0
+        self.last_stable_fit_ns = 0
+        self.fit_times_ms = deque(maxlen=200)
+        self.last_control_generation = 0
         self.coordinate_key = None
         self.capture = None
         self.capture_owner = None
@@ -147,7 +155,7 @@ class Window(QMainWindow):
         title = QLabel("beamic pro")
         title.setStyleSheet("font-size:26px; font-weight:700; color:#7ce5cb")
         header.addWidget(title)
-        self.source_label = QLabel("尚未连接 · 图像仅在内存中使用")
+        self.source_label = QLabel("尚未连接 · 默认仅在内存使用，诊断保存需手动开启")
         header.addWidget(self.source_label, 1)
         demo_button = QPushButton("模拟光路")
         demo_button.clicked.connect(self.connect_demo)
@@ -158,6 +166,10 @@ class Window(QMainWindow):
         restart_button = QPushButton("开始采集／刷新预检")
         restart_button.clicked.connect(self.restart_real_capture)
         header.addWidget(restart_button)
+        self.pause_button = QPushButton("暂停采集／记录")
+        self.pause_button.setEnabled(False)
+        self.pause_button.clicked.connect(self.pause_real_capture)
+        header.addWidget(self.pause_button)
         outer.addLayout(header)
         controls = QHBoxLayout()
         controls.addWidget(QLabel("目标新帧率"))
@@ -362,6 +374,24 @@ class Window(QMainWindow):
         report_button = QPushButton("导出兼容性／性能报告（不含图像）")
         report_button.clicked.connect(self.save_report)
         dlayout.addWidget(report_button)
+        self.diagnostic_enabled = QCheckBox("本机诊断记录（默认关闭，不自动上传）")
+        self.diagnostic_enabled.setChecked(False)
+        dlayout.addWidget(self.diagnostic_enabled)
+        diagnostic_row = QHBoxLayout()
+        self.diagnostic_count = QSpinBox()
+        self.diagnostic_count.setRange(1, 20)
+        self.diagnostic_count.setValue(5)
+        diagnostic_row.addWidget(QLabel("原始数值图像张数"))
+        diagnostic_row.addWidget(self.diagnostic_count)
+        self.diagnostic_button = QPushButton("选择位置并开始记录…")
+        self.diagnostic_button.setEnabled(False)
+        self.diagnostic_button.clicked.connect(self.start_diagnostics)
+        self.diagnostic_enabled.toggled.connect(self.toggle_diagnostics)
+        diagnostic_row.addWidget(self.diagnostic_button)
+        dlayout.addLayout(diagnostic_row)
+        self.diagnostic_status = QLabel("未开启；默认5张，最多20张。仅保存到本机。")
+        self.diagnostic_status.setWordWrap(True)
+        dlayout.addWidget(self.diagnostic_status)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(500)
@@ -379,6 +409,28 @@ class Window(QMainWindow):
 
     def log_message(self, message):
         self.log.appendPlainText(time.strftime("%H:%M:%S ") + str(message))
+        self.recorder.note({"kind": "log", "message": str(message)[:2000]})
+
+    def toggle_diagnostics(self, enabled):
+        self.diagnostic_button.setEnabled(enabled)
+        if not enabled:
+            self.recorder.stop()
+
+    def start_diagnostics(self):
+        if not self.diagnostic_enabled.isChecked() or self.source is None:
+            self.diagnostic_status.setText("请开启诊断并先连接相机或模拟光路。")
+            return
+        folder = QFileDialog.getExistingDirectory(self, "选择本机诊断保存目录")
+        if not folder:
+            return
+        try:
+            from . import __version__
+            self.recorder.start(folder, self.diagnostic_count.value(), {
+                "application_version": __version__, "simulated": isinstance(self.source, Simulator),
+                "spot_settings": vars(self.fit_settings),
+                "notice": "软件快照序号不是硬件曝光编号；未知曝光保持未知；仅本机保存"})
+        except (OSError, RuntimeError, ValueError) as error:
+            self.diagnostic_status.setText(str(error))
 
     def analyze(self):
         while not self.analyzer_stop.wait(0.005):
@@ -394,6 +446,8 @@ class Window(QMainWindow):
                 self.signals.bridge_event.emit((generation, {"type": "error", "message": "拟合失败：" + str(error)}))
 
     def begin_source(self):
+        self.recorder.stop()
+        self.pause_button.setEnabled(False)
         self.source_generation += 1
         self.frames.clear()
         self.jobs.clear()
@@ -409,6 +463,11 @@ class Window(QMainWindow):
         self.received_rate, self.fit_rate, self.display_rate = RateMeter(), RateMeter(), RateMeter()
         self.processed_rate = RateMeter()
         self.last_frame_ns = self.last_fit_ns = 0
+        self.last_stable_fit_ns = 0
+        self.last_good_fit = None
+        self.last_good_fit_ns = 0
+        self.last_control_generation = 0
+        self.fit_times_ms.clear()
         self.latencies.clear()
         self.rate.configure(self.fps_input.value())
         self.next_render = 0
@@ -424,7 +483,10 @@ class Window(QMainWindow):
         source.rate = self.fps_input.value()
         self.source = source
         self.apply_capabilities(source.capabilities)
-        source.start(lambda frame: self.frames.put((generation, frame)),
+        def receive(frame):
+            self.recorder.offer(frame)
+            self.frames.put((generation, frame))
+        source.start(receive,
                      lambda message: self.signals.bridge_event.emit((generation, {"type": "error", "message": message})))
         self.source_label.setText("模拟光路 · 合成数据 · 不连接相机")
         self.demo_group.show()
@@ -467,6 +529,7 @@ class Window(QMainWindow):
                         try:
                             frame = holder[0].read_frame(message["descriptor"])
                             if frame:
+                                self.recorder.offer(frame)
                                 self.frames.put((generation, frame))
                         except Exception as error:
                             self.signals.bridge_event.emit((generation, {"type": "error", "message": str(error)}))
@@ -535,6 +598,17 @@ class Window(QMainWindow):
                 self.signals.operation.emit({"kind": "error", "message": str(error), "generation": generation})
         self.pool.submit(restart)
 
+    def pause_real_capture(self):
+        if not isinstance(self.source, BridgeClient):
+            return
+        source, generation = self.source, self.source_generation
+        def pause():
+            try:
+                source.command("stop")
+            except RuntimeError as error:
+                self.signals.operation.emit({"kind": "error", "message": str(error), "generation": generation})
+        self.pool.submit(pause)
+
     def bridge_event(self, payload):
         generation, event = payload
         if generation != self.source_generation or self.closing:
@@ -550,6 +624,28 @@ class Window(QMainWindow):
             self.reset_interactive("相机数据错误，请重新测量")
         elif kind == "log":
             self.log_message(event.get("message", ""))
+        elif kind == "control_state":
+            self.last_control_generation = max(self.last_control_generation, int(event["generation"]))
+            if event["phase"] == "transition":
+                self.frames.clear()
+                self.jobs.clear()
+                if self.capture:
+                    if event.get("reason") in ("set_exposure", "probe", "claim_exposure"):
+                        self.capture.fits.clear()
+                        self.capture.exposure_us = None
+                        self.capture.reason = "控制切换，等待新条件下重新累计"
+                    else:
+                        self.capture.fits.clear()
+                        self.capture.exposure_us = None
+                        self.capture.reason = "采集暂停，恢复后重新累计当前批次"
+                self.capture_ready = False
+                self.last_stable_fit_ns = 0
+                self.exposure.invalidate("采集控制切换，等待已验证的新数据")
+                if self.last_fit_ns:
+                    self.view.set_fit_freshness(False, (time.monotonic_ns() - self.last_fit_ns) / 1e9)
+                self.recorder.note({"kind": "control_state", **event})
+                if event.get("reason") != "probe":
+                    self.recorder.stop()
 
     def operation(self, result):
         if self.closing:
@@ -565,6 +661,7 @@ class Window(QMainWindow):
             self.source = result["source"]
             self.apply_capabilities(self.source.capabilities)
             self.source_label.setText("BeamMic · " + str(self.source.capabilities.get("source", "相机")))
+            self.pause_button.setEnabled(True)
         elif kind == "exposure":
             self.pending_exposure = False
             self.exposure.acknowledge(result["value"]["exposure_us"], result["value"]["epoch"])
@@ -579,6 +676,10 @@ class Window(QMainWindow):
                 self.activate(result["manifest"]["id"])
         elif kind == "log":
             self.log_message(result["message"])
+        elif kind == "diagnostic_status":
+            state = result["state"]
+            self.diagnostic_status.setText(f"{state['state']} · 已保存 {state['saved']}/{state.get('requested', 5)} 张 · "
+                                           f"漏采 {state.get('dropped', 0)} · {state.get('reason', '')}\n{state.get('folder', '')}")
         elif kind == "status_report":
             try:
                 report = result["report"]
@@ -607,11 +708,16 @@ class Window(QMainWindow):
         generation, frame = packet
         if generation != self.source_generation:
             return
+        if frame.metadata.get("control_generation", 0) < self.last_control_generation:
+            return
         if self.last_frame and frame.frame_id <= self.last_frame.frame_id:
             return
         self.last_render = now
         self.next_render = max(self.next_render + 1 / self.rate.current, now + .001)
         if self.coordinate_key is not None and frame.coordinate_key != self.coordinate_key:
+            self.recorder.stop()
+            self.last_good_fit = None
+            self.last_good_fit_ns = 0
             self.capture = None
             self.jobs.clear()
             self.last_fit = None
@@ -632,6 +738,10 @@ class Window(QMainWindow):
         self.last_frame_ns = time.monotonic_ns()
         self.received_rate.add(frame.frame_id)
         self.view.set_image(frame)
+        if self.last_fit:
+            reference_ns = self.last_good_fit_ns if not self.last_fit.valid and self.last_good_fit else self.last_fit_ns
+            age = max(0, (time.monotonic_ns() - reference_ns) / 1e9)
+            self.view.set_fit_freshness(False, age, failed=not self.last_fit.valid)
         self.jobs.put((frame, self.view.selection, generation, self.selection_generation, self.fit_settings))
         request = self.exposure.inspect(frame, self.view.selection) if self.source and self.capture_ready else None
         if not self.capture_ready:
@@ -668,18 +778,31 @@ class Window(QMainWindow):
             return
         if self.last_frame and isinstance(frame, PreviewFrame) != isinstance(self.last_frame, PreviewFrame):
             return
+        if frame.metadata.get("control_generation", 0) < self.last_control_generation:
+            return
         if self.last_fit and fit.frame_id <= self.last_fit.frame_id:
             return
-        self.last_fit, self.last_fit_ns = fit, time.monotonic_ns()
+        self.last_fit, self.last_fit_ns = fit, frame.received_ns
+        self.fit_times_ms.append(elapsed * 1000)
+        self.recorder.note({"kind": "fit", "frame_id": frame.frame_id, "fit": fit.to_dict(), "fit_ms": elapsed * 1000})
         self.processed_rate.add(frame.frame_id)
         stable = (self.capture_ready and self.exposure.state.stable and self.exposure.state.mode == "measurement"
                   and frame.exposure_epoch == self.exposure.state.epoch
                   and self.exposure.last_exposure is not None
                   and np.isclose(frame.exposure_us, self.exposure.last_exposure, rtol=.005)
-                  and self.last_frame and frame.coordinate_key == self.last_frame.coordinate_key)
+                  and self.last_frame and frame.coordinate_key == self.last_frame.coordinate_key
+                  and time.monotonic_ns() - frame.received_ns <= 2_000_000_000)
         if fit.valid and stable:
             self.fit_rate.add(frame.frame_id)
+        self.last_stable_fit_ns = frame.received_ns if fit.valid and stable else 0
         self.view.overlays(fit, [shape for shapes in self.overlays.values() for shape in shapes])
+        if fit.valid:
+            self.last_good_fit, self.last_good_fit_ns = fit, frame.received_ns
+        elif self.last_good_fit and time.monotonic_ns() - self.last_good_fit_ns <= 2_000_000_000:
+            self.view.overlays(self.last_good_fit, [shape for shapes in self.overlays.values() for shape in shapes])
+        is_current = bool(fit.valid and self.last_frame and frame.frame_id == self.last_frame.frame_id)
+        age_ns = frame.received_ns if fit.valid or not self.last_good_fit else self.last_good_fit_ns
+        self.view.set_fit_freshness(is_current, max(0, (time.monotonic_ns() - age_ns) / 1e9), failed=not fit.valid)
         self.update_circle_button()
         if self.last_frame and frame.frame_id == self.last_frame.frame_id:
             self.view.set_image(frame, fit)
@@ -709,9 +832,13 @@ class Window(QMainWindow):
                 self.capture = None
                 self.capture_label.setText(str(error))
                 self.reset_interactive(str(error))
+        # A completed fit belongs to its own numeric frame even if preview advanced.
+        # Never substitute last_good_fit here: that is a display-only reference.
         if self.plugins and not isinstance(frame, PreviewFrame):
             descriptor = self.publisher.publish(frame)
             descriptor["frame"]["metadata"] = {**frame.metadata, "measurement_stable": bool(stable), "quantitative_ready": self.capture_ready,
+                                                "matches_display_frame": is_current,
+                                                "fit_age_ms": max(0, (time.monotonic_ns() - frame.received_ns) / 1e6),
                                                 "selection": self.view.selection,
                                                 "auto_exposure": self.exposure.enabled}
             for plugin in list(self.plugins.values()):
@@ -720,13 +847,12 @@ class Window(QMainWindow):
 
     def update_status(self):
         latency = float(np.percentile(self.latencies, 95)) if self.latencies else 0
-        label = "预览收帧（帧标识未验证）" if isinstance(self.last_frame, PreviewFrame) else "新帧"
+        label = "预览快照（来源未验证）" if isinstance(self.last_frame, PreviewFrame) else "测量快照"
         self.metrics_label.setText(f"{label} {self.received_rate.fps:.1f} FPS · 有效拟合 {self.fit_rate.fps:.1f} FPS · "
                                   f"显示 {self.display_rate.fps:.1f} FPS · 收帧→显示 P95 {latency:.1f} ms · 当前目标 {self.rate.current:g}")
-        throughput = self.received_rate.fps
-        if self.processed_rate.fps > 0:
-            throughput = min(throughput, self.processed_rate.fps)
-        lowered = self.rate.observe(throughput, latency)
+        # Fitting has its own latest-frame mailbox; slow analysis must not throttle preview.
+        render_latency = float(np.percentile(self.view.render_times_ms, 95)) if self.view.render_times_ms else 0
+        lowered = self.rate.observe(self.received_rate.fps, render_latency)
         if lowered is not None:
             self.log_message(f"吞吐或延迟不稳定，目标速率自动降低到 {lowered:g} FPS")
             if self.source:
@@ -738,8 +864,14 @@ class Window(QMainWindow):
                 self.capture = None
                 self.capture_label.setText("测量暂停：没有新帧，请检查相机与遮光。")
                 self.reset_interactive("没有新帧，请重新测量")
-        if self.last_fit_ns and time.monotonic_ns() - self.last_fit_ns > 300_000_000:
-            self.view.overlays(None, [shape for shapes in self.overlays.values() for shape in shapes])
+        if self.last_fit_ns:
+            reference_ns = self.last_good_fit_ns if self.last_fit and not self.last_fit.valid and self.last_good_fit else self.last_fit_ns
+            age = max(0, (time.monotonic_ns() - reference_ns) / 1e9)
+            current = bool(self.last_fit and self.last_fit.valid and self.last_frame and self.last_fit.frame_id == self.last_frame.frame_id
+                           and self.last_frame.metadata.get("control_generation", 0) >= self.last_control_generation)
+            self.view.set_fit_freshness(current, age, failed=bool(self.last_fit and not self.last_fit.valid))
+            if age > 2:
+                self.view.overlays(None, [shape for shapes in self.overlays.values() for shape in shapes])
             self.update_circle_button()
 
     def update_circle_button(self):
@@ -758,7 +890,8 @@ class Window(QMainWindow):
                                      "圈默认标出中心；实际定位和测量持续更新。")
         self.fixed_circle_button.setText("解除固定" if fixed else "固定圈")
         self.fixed_circle_button.setEnabled(self.auto_circle.isChecked() and
-                                            (fixed or bool(self.view.current_fit and self.view.current_fit.valid)))
+                                            (fixed or bool(self.view.current_fit and self.view.current_fit.valid
+                                                           and self.view.fit_age_s <= 2 and not self.view.fit_failed)))
 
     def change_auto_circle(self, enabled):
         self.view.set_auto_circle(enabled)
@@ -1004,6 +1137,8 @@ class Window(QMainWindow):
 
     def send_action(self, action):
         if self.interactive and self.interactive in self.plugins:
+            if not self.allow_guidance_action(action):
+                return
             if action == "reset":
                 self.capture = None
             try:
@@ -1013,6 +1148,15 @@ class Window(QMainWindow):
 
     def waist_action(self, action, values):
         self.panel_action("waist", action, values)
+
+    def allow_guidance_action(self, action):
+        if action not in ("confirm_near", "confirm_far"):
+            return True
+        fresh = (self.capture_ready and self.exposure.state.stable and self.last_stable_fit_ns
+                 and time.monotonic_ns() - self.last_stable_fit_ns <= 2_000_000_000)
+        if not fresh:
+            self.log_message("到位确认暂停：等待新的有效定位结果；参考圈不能作为到位依据。")
+        return bool(fresh)
 
     def level_sim_change(self, *_):
         if isinstance(self.source, Simulator) and self.source.level_mode:
@@ -1038,6 +1182,8 @@ class Window(QMainWindow):
             return
         plugin = self.plugins.get(identity)
         if plugin is None or self.interactive != identity:
+            return
+        if not self.allow_guidance_action(action):
             return
         if action in ("reset", "coupler_changed"):
             self.capture = None
@@ -1129,6 +1275,13 @@ class Window(QMainWindow):
                                      "boundary_fraction": self.fit_settings.boundary_fraction,
                                      "boundary_kind": "relative_intensity"}
         report["auto_exposure"] = self.exposure.enabled
+        report["fit_p95_ms"] = float(np.percentile(self.fit_times_ms, 95)) if self.fit_times_ms else None
+        report["render_p95_ms"] = float(np.percentile(self.view.render_times_ms, 95)) if self.view.render_times_ms else None
+        report["host_frame_descriptors_received"] = getattr(self.source, "receive_count", None)
+        copies = list(getattr(self.source, "copy_times_ms", []))
+        report["host_mapping_copy_p95_ms"] = float(np.percentile(copies, 95)) if copies else None
+        report["ui_consumed_fps"] = self.received_rate.fps
+        report["diagnostic_recording"] = {k: v for k, v in self.recorder.status.items() if k not in ("frames", "events")}
         report["preview_only"] = isinstance(self.last_frame, PreviewFrame) or self.capabilities.get("preview_only", False)
         report["fps_note"] = "预览收帧速度不代表已验证的相机有效新帧速度" if report["preview_only"] else "有效新帧率仍需实机核查"
         source, generation = self.source, self.source_generation
@@ -1150,6 +1303,8 @@ class Window(QMainWindow):
         self.tick_timer.stop()
         self.status_timer.stop()
         self.analyzer_stop.set()
+        self.recorder.notify = lambda status: None
+        self.recorder.stop(wait=True)
         self.store.cancel_event.set()
         for plugin in list(self.plugins.values()):
             plugin.close()
